@@ -17,6 +17,7 @@ const (
 	ErrInput          = ErrorSymbol("bad_input")
 	ErrInvalidHex     = ErrorSymbol("invalid_hex")
 	ErrInitialization = ErrorSymbol("contract_not_initialized")
+	ErrState          = ErrorSymbol("invalid_state_transition")
 	ErrIntent         = ErrorSymbol("intent_error")
 	ErrBalance        = ErrorSymbol("insufficient_balance")
 	ErrArithmetic     = ErrorSymbol("overflow_underflow")

@@ -11,12 +11,29 @@ import (
 func main() {}
 
 const (
-	KeyLastHeight  = "h"
-	KeyBlockPrefix = "b-"
-	KeyGroth16Vk   = "vk"
-	KeyVkRoot      = "vr"
-	KeySp1VkeyHash = "sp1vk"
+	KeyLastHeight   = "h"
+	KeyBlockPrefix  = "b-"
+	KeyGroth16Vk    = "vk"
+	KeyVkRoot       = "vr"
+	KeySp1VkeyHash  = "sp1vk"
 	KeyMaxRetention = "mr"
+
+	// W4 Cluster B CRIT #25 — cross-batch parent anchor.
+	// On every successful submitProof, KeyLastBlockHash is updated to the
+	// last (highest-numbered) block hash in the batch. The next batch must
+	// satisfy `parsed[0].ParentHash == lastBlockHash` at the top of
+	// submitProof, preventing a forged "first proof" from injecting an
+	// arbitrary state. Seeded by `initContract` via the new
+	// `initial_block_hash` parameter (atomic backfill at deploy time).
+	KeyLastBlockHash = "lbh"
+
+	// W4 Cluster B HIGH #22 — ELF hash pinning.
+	// SHA-256 of the SP1 ELF binary the prover is expected to use. The
+	// prover startup check reads this and fatal-exits on mismatch. Set
+	// via `setExpectedElfHash` admin handler (Fund-affecting class,
+	// 400K-block timelock — owned by Cluster B per v18 §AI).
+	KeyExpectedElfHash = "elfhash"
+
 	DefaultMaxRetention = uint64(10000)
 
 	// Max headers per transaction. Limited by Magi's 16KB MAX_TX_SIZE.
@@ -24,37 +41,168 @@ const (
 	MaxHeadersPerTx = 12
 
 	// ProofOutputs ABI layout (alloy::abi_encode of the SP1 program's output struct).
-	// alloy emits a 32-byte tuple head offset (always 0x20), then 8 head fields of
-	// 32 bytes each, then the dynamic tail. This contract reads fields 5/6/7 only.
-	// Offsets are computed from a fixed PvAbiOffset = 32; we assert the runtime
-	// value equals that constant before indexing, so int conversion is unnecessary.
-	PvAbiOffset        = 32                 // alloy tuple head, asserted equal at runtime
-	PvFieldStateRoot   = PvAbiOffset + 5*32 // 192
-	PvFieldBlockHash   = PvAbiOffset + 6*32 // 224
-	PvFieldBlockNumber = PvAbiOffset + 7*32 // 256
-	PvMinLen           = PvAbiOffset + 8*32 // 288 — 8 head fields fully present
+	//
+	// W4 Cluster B CRIT #6 Site 6 + W1-cluster-B-schema §1 LOCKED (v17.1 §G):
+	// 12 head slots: 10 static fields (slots 0-9) + slot 10 (storageSlots
+	// dynamic offset pointer) + slot 11 (chainId, NEW — appended last in the
+	// sol! struct definition in sp1-helios-magi/primitives/src/types.rs).
+	// This contract reads slots 5/6/7 (stateRoot/blockHash/blockNumber) for
+	// legacy reads and slot 11 (chainId) for chain-binding verification.
+	// PvMinLen=288 covers legacy slot 5/6/7 reads (kept for backward-compat
+	// parsers that don't need chainId); PvMinLenWithChainId=416 covers the
+	// full extended struct and MUST be checked before reading PvFieldChainId.
+	//
+	// Append-last position rationale: inserting chainId before storageSlots
+	// would shift the slot-10 dynamic offset pointer and break every
+	// positional decoder. Appending preserves slots 0-10 byte-for-byte.
+	PvAbiOffset         = 32                  // alloy tuple head, asserted equal at runtime
+	PvFieldStateRoot    = PvAbiOffset + 5*32  // 192
+	PvFieldBlockHash    = PvAbiOffset + 6*32  // 224
+	PvFieldBlockNumber  = PvAbiOffset + 7*32  // 256
+	PvMinLen            = PvAbiOffset + 8*32  // 288 — legacy: 8 head slots fully present
+	PvFieldChainId      = PvAbiOffset + 11*32 // 384 — slot 11 (chainId)
+	PvMinLenWithChainId = PvAbiOffset + 12*32 // 416 — 12 head slots (covers chainId read)
 )
 
 // --- Admin actions ---
 
+// InitContractParams — W1-cluster-B-schema §3 + v20 §BG LOCKED.
+// Extended with:
+//   - InitialBlockHash + InitialHeight (CRIT #25 atomic anchor backfill)
+//   - IsTestnet (Cluster E clearTestnetState gate sentinel)
+type InitContractParams struct {
+	Groth16Vk        string `json:"groth16_vk"`
+	VkRoot           string `json:"vk_root"`
+	Sp1VkeyHash      string `json:"sp1_vkey_hash"`
+	MaxRetention     uint64 `json:"max_retention"`
+	InitialHeight    uint64 `json:"initial_height"`
+	InitialBlockHash string `json:"initial_block_hash"`
+	IsTestnet        bool   `json:"is_testnet"`
+}
+
 //go:wasmexport init
 func initContract(input *string) *string {
 	checkOwner()
-	var params struct {
-		Groth16Vk   string `json:"groth16_vk"`
-		VkRoot      string `json:"vk_root"`
-		Sp1VkeyHash string `json:"sp1_vkey_hash"`
+
+	// W4 Cluster B v19 §AT + v20 §BF + S-B-v18-3: one-shot re-entry guard.
+	// First call (deploy-time) bypasses any timelock — submitProof cannot
+	// function until init has set the vkey state, so a 14-day timelock on
+	// first init would brick the bridge for 14 days. Re-entry (after any
+	// vkey state already installed) is blocked entirely; subsequent vkey
+	// rotations must go through updateVkey (which IS wrapped in the 400K
+	// propose/execute pattern per Cluster B v18 §AF). Re-entry guard also
+	// covers the case where updateVkey has run (it also writes KeyGroth16Vk)
+	// — intentional, per S-B-v19-NOTABLE-3.
+	if existing := sdk.StateGetObject(KeyGroth16Vk); existing != nil && *existing != "" {
+		ce.Abort(ce.ErrState, "already initialized — use updateVkey (with propose/execute timelock) to rotate", "init")
 	}
+
+	var params InitContractParams
 	if err := json.Unmarshal([]byte(*input), &params); err != nil {
 		ce.Abort(ce.ErrJson, "invalid JSON", "init")
 	}
 	if params.Groth16Vk == "" || params.VkRoot == "" || params.Sp1VkeyHash == "" {
 		ce.Abort(ce.ErrInput, "groth16_vk, vk_root, and sp1_vkey_hash required", "init")
 	}
+
+	// W4 Cluster B CRIT #25 + B-B-4: require initial anchor params.
+	// Without these, submitProof would either reject all proofs ("anchor
+	// not set") or accept a forged batch whose ParentHash matches the
+	// uninitialized zero hash. The guard closes the N2 bypass window.
+	if params.InitialBlockHash == "" || params.InitialHeight == 0 {
+		ce.Abort(ce.ErrInput, "initial_block_hash and initial_height required for anchor", "init")
+	}
+	// Sanity-check the anchor hash shape (0x-prefixed 64-hex == 32 bytes).
+	if !looksLikeBlockHash(params.InitialBlockHash) {
+		ce.Abort(ce.ErrInput, "initial_block_hash must be 0x-prefixed 32-byte hex", "init")
+	}
+
 	sdk.StateSetObject(KeyGroth16Vk, params.Groth16Vk)
 	sdk.StateSetObject(KeyVkRoot, params.VkRoot)
 	sdk.StateSetObject(KeySp1VkeyHash, params.Sp1VkeyHash)
-	sdk.StateSetObject(KeyMaxRetention, strconv.FormatUint(DefaultMaxRetention, 10))
+
+	retention := params.MaxRetention
+	if retention == 0 {
+		retention = DefaultMaxRetention
+	}
+	sdk.StateSetObject(KeyMaxRetention, strconv.FormatUint(retention, 10))
+
+	// CRIT #25 atomic anchor: seed KeyLastBlockHash and last-height so the
+	// first submitProof batch must produce a header whose ParentHash equals
+	// this anchor. Seeded values come from the W0 operator runbook P5 step
+	// (operator selects a recent finalized L1 block, queries its hash via
+	// any trusted source, includes here at deploy time).
+	sdk.StateSetObject(KeyLastBlockHash, params.InitialBlockHash)
+	sdk.StateSetObject(KeyLastHeight, strconv.FormatUint(params.InitialHeight, 10))
+
+	// v20 §BG: testnet sentinel for Cluster E's clearTestnetState. ABSENCE
+	// of this key == mainnet; presence == testnet. Mainnet deploys MUST
+	// pass IsTestnet=false; clearTestnetState reads this sentinel.
+	if params.IsTestnet {
+		sdk.StateSetObject("is_testnet", "true")
+	}
+
+	return nil
+}
+
+// looksLikeBlockHash — minimal shape check for InitialBlockHash. Full
+// 32-byte/hex validation happens implicitly at the first submitProof
+// (the comparison vs parsed[0].ParentHash will fail loudly on any
+// malformed value).
+func looksLikeBlockHash(s string) bool {
+	if len(s) != 66 {
+		return false
+	}
+	if s[0] != '0' || (s[1] != 'x' && s[1] != 'X') {
+		return false
+	}
+	for i := 2; i < len(s); i++ {
+		c := s[i]
+		if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') && !(c >= 'A' && c <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+// setExpectedElfHash — W4 Cluster B HIGH #22 Site 12 (v18 §AI + §AF):
+// admin handler to pin the SHA-256 hash of the SP1 ELF binary the prover
+// is allowed to use. Prover startup reads this and fatal-exits on
+// mismatch. Fund-affecting class (wrong hash = bridge halt; malicious
+// setExpectedElfHash + compromised prover = attacker controls all
+// ZK-verified Ethereum state). Owner-gated here; the 400K-block
+// propose/execute timelock wrap lives in the ZK verifier admin gates
+// section (Cluster B owns this end-to-end per v18 §AF; Cluster C
+// explicitly out-of-scope for ZK verifier handlers).
+//
+// Until the first successful setExpectedElfHash, the prover startup
+// check logs a WARNING and continues — this allows a clean deploy-then-
+// pin sequence during the W0 P5 ramp-up window (operator computes the
+// hash from the deployed prover, then proposes/executes via the timelock).
+//go:wasmexport setExpectedElfHash
+func setExpectedElfHash(input *string) *string {
+	checkOwner()
+	var params struct {
+		Hash string `json:"hash"`
+	}
+	if err := json.Unmarshal([]byte(*input), &params); err != nil {
+		ce.Abort(ce.ErrJson, "invalid JSON", "setExpectedElfHash")
+	}
+	// SHA-256 hex form: 64 hex chars, optionally 0x-prefixed.
+	h := params.Hash
+	if len(h) >= 2 && (h[:2] == "0x" || h[:2] == "0X") {
+		h = h[2:]
+	}
+	if len(h) != 64 {
+		ce.Abort(ce.ErrInput, "hash must be 32-byte hex (64 chars, optional 0x prefix)", "setExpectedElfHash")
+	}
+	for i := 0; i < len(h); i++ {
+		c := h[i]
+		if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') && !(c >= 'A' && c <= 'F') {
+			ce.Abort(ce.ErrInput, "hash contains non-hex character", "setExpectedElfHash")
+		}
+	}
+	sdk.StateSetObject(KeyExpectedElfHash, h)
 	return nil
 }
 
@@ -128,14 +276,32 @@ func submitProof(input *string) *string {
 		ce.Abort(ce.ErrTransaction, "proof verification failed", "submitProof")
 	}
 
-	// 2. Decode publicValues to get proven block hash and number
+	// 2. Decode publicValues to get proven block hash, number, and chainId.
 	pvBytes, err := hex.DecodeString(params.PublicValues)
 	if err != nil {
 		ce.Abort(ce.ErrInvalidHex, "invalid public_values hex", "submitProof")
 	}
-	provenStateRoot, provenBlockHash, provenBlockNumber, perr := parseProvenFields(pvBytes)
+	// W4 Cluster B CRIT #6 Site 6: chainId is now returned from
+	// parseProvenFields (slot 11 of ProofOutputs).
+	provenStateRoot, provenBlockHash, provenBlockNumber, provenChainId, perr := parseProvenFields(pvBytes)
 	if perr != nil {
 		ce.CustomAbort(ce.Prepend(perr, "submitProof"))
+	}
+
+	// W4 Cluster B CRIT #25 — anchor check.
+	// Read the cross-batch anchor BEFORE parsing headers. Without an
+	// anchor (empty or zero hash), every prior submission state is
+	// untrusted and a forged "first batch" could inject arbitrary state.
+	// initContract MUST have set this; the InitContractParams.
+	// InitialBlockHash guard at init time prevents zero-anchor deploys.
+	anchorPtr := sdk.StateGetObject(KeyLastBlockHash)
+	if anchorPtr == nil || *anchorPtr == "" || *anchorPtr == "0x0000000000000000000000000000000000000000000000000000000000000000" {
+		ce.Abort(ce.ErrInitialization, "lastBlockHash anchor not set; call initContract with initial_block_hash", "submitProof")
+	}
+	anchorHex := *anchorPtr
+	// Strip 0x prefix to compare against the keccak hex (which is bare hex).
+	if len(anchorHex) >= 2 && (anchorHex[0:2] == "0x" || anchorHex[0:2] == "0X") {
+		anchorHex = anchorHex[2:]
 	}
 
 	// 3. Parse every header from its RLP and compute keccak hashes.
@@ -147,6 +313,15 @@ func submitProof(input *string) *string {
 	for i, h := range params.Headers {
 		parsed[i] = parseHeader(h.RlpHex)
 		hashes[i] = sdk.Keccak256(h.RlpHex)
+	}
+
+	// W4 Cluster B CRIT #25 — cross-batch parent check.
+	// The first header in this batch MUST extend the previously-stored
+	// chain at exactly `parsed[0].ParentHash == lastBlockHash`. This
+	// closes the "unbound prevHeader" gap that let any well-formed proof
+	// for ANY hash chain land regardless of the contract's prior history.
+	if hex.EncodeToString(parsed[0].ParentHash[:]) != anchorHex {
+		ce.Abort(ce.ErrTransaction, "parent hash of first header does not match stored anchor (lastBlockHash)", "submitProof")
 	}
 
 	// 4. Bind the last header's RLP and extracted fields to the proof's public inputs.
@@ -174,6 +349,10 @@ func submitProof(input *string) *string {
 	}
 
 	// 6. Sequential block-number check + store the RLP-extracted fields.
+	// W4 Cluster B Site 6 + §AW: every stored header gains a ChainId
+	// field populated from the proven slot-11 value. This is the
+	// authoritative ChainId for the EthBlockHeader the account-mapping
+	// contract reads downstream (CRIT #6 Site 2 ERC-20 path).
 	lastHeight := getLastHeight()
 	maxRetention := getMaxRetention()
 	for i := range parsed {
@@ -185,7 +364,7 @@ func submitProof(input *string) *string {
 			ce.Abort(ce.ErrInput, "headers not sequential within batch", "submitProof")
 		}
 
-		storeHeader(p.BlockNumber, p.StateRoot, p.TxRoot, p.RcptRoot, p.BaseFeePerGas, p.GasLimit, p.Timestamp)
+		storeHeader(p.BlockNumber, p.StateRoot, p.TxRoot, p.RcptRoot, p.BaseFeePerGas, p.GasLimit, p.Timestamp, provenChainId)
 		lastHeight = p.BlockNumber
 
 		if p.BlockNumber > maxRetention {
@@ -194,6 +373,14 @@ func submitProof(input *string) *string {
 	}
 
 	sdk.StateSetObject(KeyLastHeight, strconv.FormatUint(lastHeight, 10))
+
+	// W4 Cluster B CRIT #25 — update anchor for the next batch. Use the
+	// hex of the last header's keccak so the next call's parsed[0].
+	// ParentHash check has a canonical form to match against. Prepend 0x
+	// for consistency with the InitialBlockHash format (initContract
+	// validates 0x-prefixed input; stored value retains the prefix so
+	// off-chain tooling reads back identical to what was supplied).
+	sdk.StateSetObject(KeyLastBlockHash, "0x"+hashes[lastIdx])
 	return nil
 }
 
@@ -210,6 +397,14 @@ func submitProof(input *string) *string {
 //   7  difficulty         (16+ withdrawalsRoot/blob fields ignored)
 //   8  number
 
+// parsedHeader — W4 Cluster B Site 4 + §AW disambiguation.
+// ChainId field added but NOT populated by parseHeader (Ethereum RLP
+// block headers have no chainId field — adding RLP extraction would be
+// wrong). ChainId here is populated from parseProvenFields' return
+// value (slot 11 of ProofOutputs) in submitProof, then forwarded into
+// storeHeader. This struct's ChainId is informational only; the
+// authoritative chainId is the function-local provenChainId that the
+// submitProof loop passes into storeHeader.
 type parsedHeader struct {
 	BlockNumber   uint64
 	ParentHash    [32]byte
@@ -219,6 +414,7 @@ type parsedHeader struct {
 	GasLimit      uint64
 	Timestamp     uint64
 	BaseFeePerGas uint64
+	ChainId       uint64 // populated post-parseProvenFields, NOT from RLP
 }
 
 func parseHeader(rlpHex string) parsedHeader {
@@ -346,8 +542,22 @@ func readUintField(buf []byte, offset int) (int, uint64) {
 
 // --- Storage helpers ---
 
-func storeHeader(blockNumber uint64, stateRoot, txRoot, rcptRoot [32]byte, baseFee, gasLimit, timestamp uint64) {
-	buf := make([]byte, 0, 128)
+// HeaderVersionV1 + storeHeader — W4 Cluster B Site 4/6 unified layout.
+// The serialized form MUST match the account-mapping EthBlockHeader
+// serialization byte-for-byte (137 bytes total, version+128+chainId).
+// account-mapping reads from this contract's KeyBlockPrefix via the
+// VerifierContractIdKey indirection — any layout drift would silently
+// misread chainId or baseFee.
+//
+// Layout (LOCKED, mirrors account-mapping/contract/blocklist/blocks.go):
+//   [version:1][blockNumber:8][stateRoot:32][txRoot:32][rcptRoot:32]
+//   [baseFee:8][gasLimit:8][timestamp:8][chainId:8] = 137 bytes.
+const HeaderVersionV1 byte = 0x01
+const HeaderSerializedSize = 137
+
+func storeHeader(blockNumber uint64, stateRoot, txRoot, rcptRoot [32]byte, baseFee, gasLimit, timestamp, chainId uint64) {
+	buf := make([]byte, 0, HeaderSerializedSize)
+	buf = append(buf, HeaderVersionV1)
 	buf = appendUint64(buf, blockNumber)
 	buf = append(buf, stateRoot[:]...)
 	buf = append(buf, txRoot[:]...)
@@ -355,6 +565,10 @@ func storeHeader(blockNumber uint64, stateRoot, txRoot, rcptRoot [32]byte, baseF
 	buf = appendUint64(buf, baseFee)
 	buf = appendUint64(buf, gasLimit)
 	buf = appendUint64(buf, timestamp)
+	// W4 Cluster B Site 6: appended chainId; populated from the proven
+	// slot-11 value of ProofOutputs. account-mapping/blocklist/blocks.go
+	// DeserializeHeader reads this at byte offset 129-136.
+	buf = appendUint64(buf, chainId)
 	sdk.StateSetObject(KeyBlockPrefix+strconv.FormatUint(blockNumber, 10), string(buf))
 }
 
@@ -394,20 +608,38 @@ func readUint64BE(b []byte) uint64 {
 		uint64(b[4])<<24 | uint64(b[5])<<16 | uint64(b[6])<<8 | uint64(b[7])
 }
 
-// parseProvenFields extracts (executionStateRoot, executionBlockHash, executionBlockNumber)
-// from the SP1 program's ABI-encoded ProofOutputs bytes. Returns a non-nil *ContractError
-// on any structural problem. No SDK calls — pure function, safe to test under standard
-// go test (contracterrors transitively imports sdk but its construction path doesn't
-// exercise any wasmimport).
-func parseProvenFields(pvBytes []byte) (stateRoot, blockHash string, blockNumber uint64, err *ce.ContractError) {
+// parseProvenFields extracts (executionStateRoot, executionBlockHash,
+// executionBlockNumber, chainId) from the SP1 program's ABI-encoded
+// ProofOutputs bytes. Returns a non-nil *ContractError on any structural
+// problem. No SDK calls — pure function, safe to test under standard
+// go test (contracterrors transitively imports sdk but its construction
+// path doesn't exercise any wasmimport).
+//
+// W4 Cluster B CRIT #6 Site 6 + S-B-v17-4 comment fix:
+//   - Extended return signature adds `chainId uint64` (slot 11).
+//   - Length check is split: legacy parsers see PvMinLen=288, chainId-aware
+//     callers MUST pass a buffer >= PvMinLenWithChainId=416.
+//   - chainId is read as uint64 big-endian from the LAST 8 bytes of the
+//     32-byte ABI slot at offset PvFieldChainId (same pattern as
+//     blockNumber). See sp1-helios-magi/primitives/src/types.rs for the
+//     authoritative sol struct.
+func parseProvenFields(pvBytes []byte) (stateRoot, blockHash string, blockNumber, chainId uint64, err *ce.ContractError) {
 	if len(pvBytes) < PvMinLen {
-		return "", "", 0, ce.NewContractError(ce.ErrInput, "public_values too short for ABI fields")
+		return "", "", 0, 0, ce.NewContractError(ce.ErrInput, "public_values too short for ABI fields")
 	}
 	if readUint64BE(pvBytes[24:32]) != PvAbiOffset {
-		return "", "", 0, ce.NewContractError(ce.ErrInput, "unexpected ABI tuple offset (expected 32)")
+		return "", "", 0, 0, ce.NewContractError(ce.ErrInput, "unexpected ABI tuple offset (expected 32)")
 	}
 	stateRoot = hex.EncodeToString(pvBytes[PvFieldStateRoot : PvFieldStateRoot+32])
 	blockHash = hex.EncodeToString(pvBytes[PvFieldBlockHash : PvFieldBlockHash+32])
 	blockNumber = readUint64BE(pvBytes[PvFieldBlockNumber+24 : PvFieldBlockNumber+32])
+	// W4 Cluster B Site 6: chainId is in slot 11 (PvFieldChainId=384).
+	// Require the full extended length before reading; legacy callers that
+	// only need stateRoot/blockHash/blockNumber are at line above and have
+	// already been served by the PvMinLen=288 check.
+	if len(pvBytes) < PvMinLenWithChainId {
+		return "", "", 0, 0, ce.NewContractError(ce.ErrInput, "public_values too short for chainId field")
+	}
+	chainId = readUint64BE(pvBytes[PvFieldChainId+24 : PvFieldChainId+32])
 	return
 }
