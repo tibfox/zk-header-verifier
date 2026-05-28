@@ -62,8 +62,27 @@ After deployment, call `init` with:
 {
   "groth16_vk": "<hex: 492-byte Groth16 verification key for the SP1 version>",
   "vk_root": "<hex: 32-byte SP1 recursion VK root>",
-  "sp1_vkey_hash": "<hex: 32-byte SP1 program verification key hash>"
+  "sp1_vkey_hash": "<hex: 32-byte SP1 program verification key hash>",
+  "max_retention": 50400,
+  "initial_height": 12345678,
+  "initial_block_hash": "0x<64-hex: finalized L1 block hash at initial_height>",
+  "expected_chain_id": 1,
+  "is_testnet": false
 }
 ```
 
 These values come from the SP1-Helios fork's build output and the SP1 verifier artifacts.
+
+Required / important fields (init fails closed if missing):
+
+- `initial_height` + `initial_block_hash` — CRIT #25 anchor. The first
+  `submitProof` batch must produce a header whose `ParentHash` equals
+  `initial_block_hash`. Pick a recent finalized L1 block and its hash from a
+  trusted source. Both REQUIRED (init aborts if absent/zero).
+- `expected_chain_id` — CRIT #6 Site 6 chain binding. The L1 chainId this
+  verifier is bound to (`1` mainnet, `11155111` Sepolia). REQUIRED, non-zero;
+  `submitProof` reverts any proof whose committed chainId differs. Immutable
+  after init (no setter).
+- `max_retention` — optional; defaults to `DefaultMaxRetention` when `0`.
+- `is_testnet` — set `true` ONLY on testnet so `clearTestnetState` is
+  permitted; leave `false`/unset on mainnet (the sentinel gates that handler).
