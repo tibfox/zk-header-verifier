@@ -34,6 +34,14 @@ const (
 	// 400K-block timelock — owned by Cluster B per v18 §AI).
 	KeyExpectedElfHash = "elfhash"
 
+	// W4 Cluster B CRIT #6 Site 6 enforcement: the chainId this verifier
+	// instance is bound to. Set at init from InitContractParams.ExpectedChainId.
+	// submitProof rejects any proof whose committed chainId (slot 11 of
+	// ProofOutputs) does not equal this value — otherwise a valid SP1 proof
+	// for the WRONG chain (e.g. a Sepolia proof against a mainnet verifier)
+	// would be accepted and its headers stored as authoritative.
+	KeyExpectedChainId = "cid"
+
 	DefaultMaxRetention = uint64(10000)
 
 	// Max headers per transaction. Limited by Magi's 16KB MAX_TX_SIZE.
@@ -78,6 +86,10 @@ type InitContractParams struct {
 	InitialHeight    uint64 `json:"initial_height"`
 	InitialBlockHash string `json:"initial_block_hash"`
 	IsTestnet        bool   `json:"is_testnet"`
+	// W4 Cluster B CRIT #6 Site 6: the L1 chainId this verifier is bound to
+	// (e.g. 1 mainnet, 11155111 Sepolia). submitProof enforces that every
+	// proof's committed chainId equals this. Required (non-zero) at init.
+	ExpectedChainId uint64 `json:"expected_chain_id"`
 }
 
 //go:wasmexport init
@@ -117,6 +129,13 @@ func initContract(input *string) *string {
 		ce.Abort(ce.ErrInput, "initial_block_hash must be 0x-prefixed 32-byte hex", "init")
 	}
 
+	// W4 Cluster B CRIT #6 Site 6: require the bound chainId. Without it,
+	// submitProof has nothing to compare provenChainId against and the
+	// chain-binding fix is inert (the bug the audit found).
+	if params.ExpectedChainId == 0 {
+		ce.Abort(ce.ErrInput, "expected_chain_id required (non-zero) for chain-binding enforcement", "init")
+	}
+
 	sdk.StateSetObject(KeyGroth16Vk, params.Groth16Vk)
 	sdk.StateSetObject(KeyVkRoot, params.VkRoot)
 	sdk.StateSetObject(KeySp1VkeyHash, params.Sp1VkeyHash)
@@ -134,6 +153,12 @@ func initContract(input *string) *string {
 	// any trusted source, includes here at deploy time).
 	sdk.StateSetObject(KeyLastBlockHash, params.InitialBlockHash)
 	sdk.StateSetObject(KeyLastHeight, strconv.FormatUint(params.InitialHeight, 10))
+
+	// W4 Cluster B CRIT #6 Site 6: persist the bound chainId for submitProof
+	// enforcement. Immutable after init (no setter handler — chain binding
+	// must not be admin-mutable, same rationale as account-mapping dropping
+	// setChainId per CRIT #6 Site 12).
+	sdk.StateSetObject(KeyExpectedChainId, strconv.FormatUint(params.ExpectedChainId, 10))
 
 	// v20 §BG: testnet sentinel for Cluster E's clearTestnetState. ABSENCE
 	// of this key == mainnet; presence == testnet. Mainnet deploys MUST
@@ -286,6 +311,24 @@ func submitProof(input *string) *string {
 	provenStateRoot, provenBlockHash, provenBlockNumber, provenChainId, perr := parseProvenFields(pvBytes)
 	if perr != nil {
 		ce.CustomAbort(ce.Prepend(perr, "submitProof"))
+	}
+
+	// W4 Cluster B CRIT #6 Site 6 ENFORCEMENT: reject any proof whose
+	// committed chainId does not match the chainId this verifier was bound
+	// to at init. Prior to this check the verifier parsed + stored
+	// provenChainId but never compared it, so a valid SP1 proof generated
+	// against the WRONG chain would have been accepted and its headers
+	// written as authoritative — defeating the entire chain-binding fix.
+	expectedChainPtr := sdk.StateGetObject(KeyExpectedChainId)
+	if expectedChainPtr == nil || *expectedChainPtr == "" {
+		ce.Abort(ce.ErrInitialization, "expected_chain_id not set; verifier must be initialized with expected_chain_id", "submitProof")
+	}
+	expectedChainId, ecErr := strconv.ParseUint(*expectedChainPtr, 10, 64)
+	if ecErr != nil {
+		ce.Abort(ce.ErrState, "stored expected_chain_id is not a valid uint64", "submitProof")
+	}
+	if provenChainId != expectedChainId {
+		ce.Abort(ce.ErrTransaction, "proof chainId ("+strconv.FormatUint(provenChainId, 10)+") does not match verifier's bound chainId ("+strconv.FormatUint(expectedChainId, 10)+")", "submitProof")
 	}
 
 	// W4 Cluster B CRIT #25 — anchor check.
