@@ -96,17 +96,16 @@ type InitContractParams struct {
 func initContract(input *string) *string {
 	checkOwner()
 
-	// W4 Cluster B v19 §AT + v20 §BF + S-B-v18-3: one-shot re-entry guard.
-	// First call (deploy-time) bypasses any timelock — submitProof cannot
-	// function until init has set the vkey state, so a 14-day timelock on
-	// first init would brick the bridge for 14 days. Re-entry (after any
-	// vkey state already installed) is blocked entirely; subsequent vkey
-	// rotations must go through updateVkey (which IS wrapped in the 400K
-	// propose/execute pattern per Cluster B v18 §AF). Re-entry guard also
-	// covers the case where updateVkey has run (it also writes KeyGroth16Vk)
-	// — intentional, per S-B-v19-NOTABLE-3.
+	// One-shot re-entry guard. First call (deploy-time) installs the vkey
+	// state with no timelock — submitProof cannot function until init runs,
+	// so a 14-day gate on first init would brick the bridge. Re-entry (after
+	// vkey state is installed) is blocked entirely; subsequent vkey rotations
+	// MUST go through propose() then execute() with the 400K-block timelock
+	// (see timelock.go — F1 fix; this is now a real on-chain mechanism, not a
+	// comment). Re-entry guard also covers the case where a rotation has run
+	// (execute -> applyUpdateVkey writes KeyGroth16Vk).
 	if existing := sdk.StateGetObject(KeyGroth16Vk); existing != nil && *existing != "" {
-		ce.Abort(ce.ErrState, "already initialized — use updateVkey (with propose/execute timelock) to rotate", "init")
+		ce.Abort(ce.ErrState, "already initialized — use propose/execute (400K-block timelock) to rotate the vkey", "init")
 	}
 
 	var params InitContractParams
@@ -190,31 +189,52 @@ func looksLikeBlockHash(s string) bool {
 	return true
 }
 
-// setExpectedElfHash — W4 Cluster B HIGH #22 Site 12 (v18 §AI + §AF):
-// admin handler to pin the SHA-256 hash of the SP1 ELF binary the prover
-// is allowed to use. Prover startup reads this and fatal-exits on
-// mismatch. Fund-affecting class (wrong hash = bridge halt; malicious
-// setExpectedElfHash + compromised prover = attacker controls all
-// ZK-verified Ethereum state). Owner-gated here; the 400K-block
-// propose/execute timelock wrap lives in the ZK verifier admin gates
-// section (Cluster B owns this end-to-end per v18 §AF; Cluster C
-// explicitly out-of-scope for ZK verifier handlers).
+// applySetExpectedElfHash — W4 Cluster B HIGH #22 Site 12: pins the SHA-256
+// of the SP1 ELF binary the prover is allowed to use. Prover startup reads
+// this and fatal-exits on mismatch. Fund-affecting (wrong hash = bridge halt;
+// malicious hash + compromised prover = attacker controls all ZK-verified
+// Ethereum state).
 //
-// Until the first successful setExpectedElfHash, the prover startup
-// check logs a WARNING and continues — this allows a clean deploy-then-
-// pin sequence during the W0 P5 ramp-up window (operator computes the
-// hash from the deployed prover, then proposes/executes via the timelock).
-//go:wasmexport setExpectedElfHash
-func setExpectedElfHash(input *string) *string {
-	checkOwner()
+// F1 fix: ROTATIONS are reachable ONLY via execute() after the 400K-block
+// propose/execute timelock. The FIRST pin (below) is allowed instantly during
+// deploy ramp-up — there is no trusted value to rotate FROM (the prover runs
+// UNPINNED until this is set), so an instant first pin only ADDS protection.
+// Previously this was an instant owner-only write for ALL changes (the hole),
+// with a comment claiming a timelock that did not exist.
+func applySetExpectedElfHash(payload string) {
 	var params struct {
 		Hash string `json:"hash"`
 	}
-	if err := json.Unmarshal([]byte(*input), &params); err != nil {
+	if err := json.Unmarshal([]byte(payload), &params); err != nil {
 		ce.Abort(ce.ErrJson, "invalid JSON", "setExpectedElfHash")
 	}
-	// SHA-256 hex form: 64 hex chars, optionally 0x-prefixed.
-	h := params.Hash
+	sdk.StateSetObject(KeyExpectedElfHash, normalizeElfHash(params.Hash))
+}
+
+// setExpectedElfHash — FIRST-PIN ONLY (instant, owner-gated). Allows the
+// operator to pin the SP1 ELF hash during deploy ramp-up without waiting the
+// 400K-block timelock (the prover is UNPINNED until this runs, so an instant
+// first pin only adds protection — there is nothing trusted to rotate from).
+// Once set, this aborts and directs rotations through propose/execute, which
+// IS timelocked. Mirrors init's one-shot for the vkey.
+//
+//go:wasmexport setExpectedElfHash
+func setExpectedElfHash(input *string) *string {
+	checkOwner()
+	if existing := sdk.StateGetObject(KeyExpectedElfHash); existing != nil && *existing != "" {
+		ce.Abort(ce.ErrState, "elf hash already set — use propose/execute (400K-block timelock) to rotate", "setExpectedElfHash")
+	}
+	if input == nil || *input == "" {
+		ce.Abort(ce.ErrInput, "setExpectedElfHash: empty payload", "setExpectedElfHash")
+	}
+	applySetExpectedElfHash(*input)
+	return nil
+}
+
+// normalizeElfHash validates the 32-byte SHA-256 hex (optional 0x prefix) and
+// returns the bare hex; aborts on bad shape. Shared by applySetExpectedElfHash
+// and propose()-time payload validation (timelock.go).
+func normalizeElfHash(h string) string {
 	if len(h) >= 2 && (h[:2] == "0x" || h[:2] == "0X") {
 		h = h[2:]
 	}
@@ -227,19 +247,24 @@ func setExpectedElfHash(input *string) *string {
 			ce.Abort(ce.ErrInput, "hash contains non-hex character", "setExpectedElfHash")
 		}
 	}
-	sdk.StateSetObject(KeyExpectedElfHash, h)
-	return nil
+	return h
 }
 
-//go:wasmexport updateVkey
-func updateVkey(input *string) *string {
-	checkOwner()
+// applyUpdateVkey — rotates the Groth16 / SP1 verification key (the entire ZK
+// trust root).
+//
+// F1 fix: NO LONGER a direct wasmexport. Reachable ONLY via execute() after
+// the 400K-block propose/execute timelock (see timelock.go). Previously this
+// was an instant owner-only write with a comment falsely claiming a timelock —
+// an owner-key compromise could rotate the vkey and forge L1 state with zero
+// reaction window. The timelock now gives watchers ~14 days to react.
+func applyUpdateVkey(payload string) {
 	var params struct {
 		Groth16Vk   string `json:"groth16_vk"`
 		VkRoot      string `json:"vk_root"`
 		Sp1VkeyHash string `json:"sp1_vkey_hash"`
 	}
-	if err := json.Unmarshal([]byte(*input), &params); err != nil {
+	if err := json.Unmarshal([]byte(payload), &params); err != nil {
 		ce.Abort(ce.ErrJson, "invalid JSON", "updateVkey")
 	}
 	if params.Groth16Vk != "" {
@@ -251,7 +276,6 @@ func updateVkey(input *string) *string {
 	if params.Sp1VkeyHash != "" {
 		sdk.StateSetObject(KeySp1VkeyHash, params.Sp1VkeyHash)
 	}
-	return nil
 }
 
 // --- Permissionless proof submission ---
@@ -685,4 +709,247 @@ func parseProvenFields(pvBytes []byte) (stateRoot, blockHash string, blockNumber
 	}
 	chainId = readUint64BE(pvBytes[PvFieldChainId+24 : PvFieldChainId+32])
 	return
+}
+
+// ===== F1 fix: admin propose/execute timelock (was contract/timelock.go) =====
+const (
+	KeyProposalCounter = "proposal_next_id"
+	ProposalPrefix     = "pr-"
+
+	// Fund-affecting timelock (~14 days at ~3s blocks) — same class as
+	// account-mapping's TimelockLong for setVault/setVerifierContract/vkey.
+	TimelockLong = uint64(400_000)
+	// Auto-expire window after execHeight (7 days) so stale proposals can be
+	// garbage-collected and cannot be executed long after their context.
+	ExpireWindowBlocks = uint64(201_600)
+
+	StatusPending   = uint8(0)
+	StatusAccepted  = uint8(1)
+	StatusCancelled = uint8(2)
+	StatusExpired   = uint8(3)
+)
+
+type PendingProposal struct {
+	ProposalId   uint64 `json:"proposal_id"`
+	Action       string `json:"action"`
+	PayloadHash  string `json:"payload_hash"` // keccak256 hex of Payload bytes
+	Proposer     string `json:"proposer"`
+	QueueHeight  uint64 `json:"queue_height"`
+	ExecHeight   uint64 `json:"exec_height"`
+	ExpireHeight uint64 `json:"expire_height"`
+	Payload      string `json:"payload"` // raw JSON for the action handler
+	Status       uint8  `json:"status"`
+}
+
+// timelockFor — only the two fund-affecting verifier actions are timelocked
+// and propose-able. Anything else is rejected (no silent passthrough).
+func timelockFor(action string) (uint64, bool) {
+	switch action {
+	case "updateVkey", "setExpectedElfHash":
+		return TimelockLong, true
+	default:
+		return 0, false
+	}
+}
+
+func proposalKey(id uint64) string {
+	return ProposalPrefix + strconv.FormatUint(id, 10)
+}
+
+// hashPayload — keccak256 of the raw payload bytes. sdk.Keccak256 takes a hex
+// string, so the bytes are hex-encoded first.
+func hashPayload(payload string) string {
+	return sdk.Keccak256(hex.EncodeToString([]byte(payload)))
+}
+
+func nextProposalId() uint64 {
+	s := sdk.StateGetObject(KeyProposalCounter)
+	var id uint64
+	if s != nil {
+		id, _ = strconv.ParseUint(*s, 10, 64)
+	}
+	if id == 0 {
+		id = 1
+	}
+	sdk.StateSetObject(KeyProposalCounter, strconv.FormatUint(id+1, 10))
+	return id
+}
+
+func loadProposal(id uint64) *PendingProposal {
+	d := sdk.StateGetObject(proposalKey(id))
+	if d == nil {
+		return nil
+	}
+	pp := &PendingProposal{}
+	if err := json.Unmarshal([]byte(*d), pp); err != nil {
+		return nil
+	}
+	return pp
+}
+
+func storeProposal(pp *PendingProposal) {
+	b, _ := json.Marshal(pp)
+	sdk.StateSetObject(proposalKey(pp.ProposalId), string(b))
+}
+
+// propose — owner queues a fund-affecting action. Returns {proposal_id, exec_height}.
+//
+//go:wasmexport propose
+func propose(input *string) *string {
+	checkOwner()
+	if input == nil || *input == "" {
+		ce.Abort(ce.ErrInput, "propose: empty payload", "propose")
+	}
+	var req struct {
+		Action  string `json:"action"`
+		Payload string `json:"payload"`
+	}
+	if err := json.Unmarshal([]byte(*input), &req); err != nil {
+		ce.Abort(ce.ErrJson, "propose: invalid JSON", "propose")
+	}
+	timelock, ok := timelockFor(req.Action)
+	if !ok {
+		ce.Abort(ce.ErrInput, "propose: unknown or non-timelocked action", "propose")
+	}
+	// Validate the action payload up-front so a malformed proposal cannot
+	// sit for 14 days only to fail at execute time.
+	validateActionPayload(req.Action, req.Payload)
+
+	bh := sdk.GetEnv().BlockHeight
+	id := nextProposalId()
+	execH := bh + timelock
+	pp := &PendingProposal{
+		ProposalId:   id,
+		Action:       req.Action,
+		PayloadHash:  hashPayload(req.Payload),
+		Proposer:     sdk.GetEnv().Caller.String(),
+		QueueHeight:  bh,
+		ExecHeight:   execH,
+		ExpireHeight: execH + ExpireWindowBlocks,
+		Payload:      req.Payload,
+		Status:       StatusPending,
+	}
+	storeProposal(pp)
+	out := `{"proposal_id":` + strconv.FormatUint(id, 10) + `,"exec_height":` + strconv.FormatUint(execH, 10) + `}`
+	return &out
+}
+
+// execute — owner enacts a proposal once its timelock has elapsed.
+//
+//go:wasmexport execute
+func execute(input *string) *string {
+	checkOwner()
+	var req struct {
+		ProposalId uint64 `json:"proposal_id"`
+	}
+	if input == nil || json.Unmarshal([]byte(*input), &req) != nil {
+		ce.Abort(ce.ErrInput, "execute: invalid JSON", "execute")
+	}
+	pp := loadProposal(req.ProposalId)
+	if pp == nil {
+		ce.Abort(ce.ErrInput, "execute: proposal not found", "execute")
+	}
+	if pp.Status != StatusPending {
+		ce.Abort(ce.ErrState, "execute: proposal not pending", "execute")
+	}
+	bh := sdk.GetEnv().BlockHeight
+	if bh < pp.ExecHeight {
+		ce.Abort(ce.ErrState, "execute: timelock not elapsed", "execute")
+	}
+	if bh >= pp.ExpireHeight {
+		ce.Abort(ce.ErrState, "execute: proposal expired", "execute")
+	}
+	// Defense-in-depth: the stored payload must still hash to the committed
+	// PayloadHash (a storage tamper between propose and execute is rejected).
+	if hashPayload(pp.Payload) != pp.PayloadHash {
+		ce.Abort(ce.ErrState, "execute: payload hash mismatch", "execute")
+	}
+	switch pp.Action {
+	case "updateVkey":
+		applyUpdateVkey(pp.Payload)
+	case "setExpectedElfHash":
+		applySetExpectedElfHash(pp.Payload)
+	default:
+		ce.Abort(ce.ErrState, "execute: unknown action", "execute")
+	}
+	pp.Status = StatusAccepted
+	storeProposal(pp)
+	return nil
+}
+
+// cancelProposal — owner aborts a pending proposal before execution.
+//
+//go:wasmexport cancelProposal
+func cancelProposal(input *string) *string {
+	checkOwner()
+	var req struct {
+		ProposalId uint64 `json:"proposal_id"`
+	}
+	if input == nil || json.Unmarshal([]byte(*input), &req) != nil {
+		ce.Abort(ce.ErrInput, "cancelProposal: invalid JSON", "cancelProposal")
+	}
+	pp := loadProposal(req.ProposalId)
+	if pp == nil {
+		ce.Abort(ce.ErrInput, "cancelProposal: proposal not found", "cancelProposal")
+	}
+	if pp.Status != StatusPending {
+		ce.Abort(ce.ErrState, "cancelProposal: proposal not pending", "cancelProposal")
+	}
+	pp.Status = StatusCancelled
+	storeProposal(pp)
+	return nil
+}
+
+// expireProposal — anyone may garbage-collect a proposal past its expire
+// window (RC cost deters spam). Cannot enact anything; only marks expired.
+//
+//go:wasmexport expireProposal
+func expireProposal(input *string) *string {
+	var req struct {
+		ProposalId uint64 `json:"proposal_id"`
+	}
+	if input == nil || json.Unmarshal([]byte(*input), &req) != nil {
+		ce.Abort(ce.ErrInput, "expireProposal: invalid JSON", "expireProposal")
+	}
+	pp := loadProposal(req.ProposalId)
+	if pp == nil {
+		ce.Abort(ce.ErrInput, "expireProposal: proposal not found", "expireProposal")
+	}
+	if pp.Status != StatusPending {
+		ce.Abort(ce.ErrState, "expireProposal: proposal not pending", "expireProposal")
+	}
+	if sdk.GetEnv().BlockHeight < pp.ExpireHeight {
+		ce.Abort(ce.ErrState, "expireProposal: not yet expired", "expireProposal")
+	}
+	pp.Status = StatusExpired
+	storeProposal(pp)
+	return nil
+}
+
+// validateActionPayload runs the same shape checks the apply* handlers run,
+// at propose() time, so a malformed payload is rejected immediately rather
+// than after the 14-day wait.
+func validateActionPayload(action, payload string) {
+	switch action {
+	case "updateVkey":
+		var p struct {
+			Groth16Vk   string `json:"groth16_vk"`
+			VkRoot      string `json:"vk_root"`
+			Sp1VkeyHash string `json:"sp1_vkey_hash"`
+		}
+		if err := json.Unmarshal([]byte(payload), &p); err != nil {
+			ce.Abort(ce.ErrJson, "propose(updateVkey): invalid payload JSON", "propose")
+		}
+		if p.Groth16Vk == "" && p.VkRoot == "" && p.Sp1VkeyHash == "" {
+			ce.Abort(ce.ErrInput, "propose(updateVkey): at least one of groth16_vk/vk_root/sp1_vkey_hash required", "propose")
+		}
+	case "setExpectedElfHash":
+		var p struct {
+			Hash string `json:"hash"`
+		}
+		if err := json.Unmarshal([]byte(payload), &p); err != nil {
+			ce.Abort(ce.ErrJson, "propose(setExpectedElfHash): invalid payload JSON", "propose")
+		}
+		normalizeElfHash(p.Hash) // aborts on bad shape
+	}
 }
