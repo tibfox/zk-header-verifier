@@ -15,9 +15,15 @@ WASM contract for Magi that verifies SP1 Groth16 proofs of Ethereum consensus an
 
 | Action | Caller | Description |
 |--------|--------|-------------|
-| `init` | Owner | Set Groth16 VK, VK root, and SP1 program vkey hash |
-| `updateVkey` | Owner | Update verification parameters (for SP1 version upgrades) |
-| `submitProof` | Anyone | Submit ZK proof + headers. Proof must be valid. Max 12 headers per tx. |
+| `init` | Owner | One-shot. Set Groth16 VK, VK root, SP1 program vkey hash, anchor (initial block hash + height), `expected_chain_id`, and `is_testnet`. Re-entry rejected. |
+| `propose` | Owner | Queue an admin action (`updateVkey` or `setExpectedElfHash` rotation) under the **400K-block timelock** (~14 days). Returns a proposal id. |
+| `execute` | Owner | Apply a previously-proposed action after its timelock has elapsed. |
+| `cancelProposal` | Owner | Cancel a still-pending proposal before its `execHeight`. |
+| `expireProposal` | Anyone | Permissionless garbage-collect of a proposal whose `expireHeight` has passed. |
+| `setExpectedElfHash` | Owner | **First pin only** (deploy ramp-up, no trusted prior hash to rotate from). After the first call, this action is rejected — rotations go through `propose` + `execute`. |
+| `submitProof` | Anyone | Submit ZK proof + headers. Proof must be valid. Max 12 headers per tx. Rejected if `provenChainId != expected_chain_id`. |
+
+`updateVkey` is no longer a direct wasmexport — it is reachable only via `propose` (action `"updateVkey"`) and `execute` after the 400K-block timelock (F1 fix). The init path remains the one place a vkey is installed without timelock (no trusted prior state to rotate from).
 
 ## State keys
 
