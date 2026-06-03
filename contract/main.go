@@ -962,9 +962,15 @@ func validateActionPayload(action, payload string) {
 		}
 		if err := json.Unmarshal([]byte(payload), &p); err != nil {
 			ce.Abort(ce.ErrJson, "propose(updateVkey): invalid payload JSON", "propose")
+			return
 		}
-		if p.Groth16Vk == "" && p.VkRoot == "" && p.Sp1VkeyHash == "" {
-			ce.Abort(ce.ErrInput, "propose(updateVkey): at least one of groth16_vk/vk_root/sp1_vkey_hash required", "propose")
+		// review6 M10 (adversarial-review correction): propose-side check must
+		// match the execute-side atomicity gate added in applyUpdateVkey.
+		// Reject a partial proposal at propose() time so it can never queue
+		// + waste a 14-day timelock cycle.
+		if p.Groth16Vk == "" || p.VkRoot == "" || p.Sp1VkeyHash == "" {
+			ce.Abort(ce.ErrInput, "propose(updateVkey) requires all three fields: groth16_vk, vk_root, sp1_vkey_hash (atomic rotation per review6 M10)", "propose")
+			return
 		}
 	case "setExpectedElfHash":
 		var p struct {
