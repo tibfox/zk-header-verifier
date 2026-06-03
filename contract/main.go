@@ -266,16 +266,22 @@ func applyUpdateVkey(payload string) {
 	}
 	if err := json.Unmarshal([]byte(payload), &params); err != nil {
 		ce.Abort(ce.ErrJson, "invalid JSON", "updateVkey")
+		return
 	}
-	if params.Groth16Vk != "" {
-		sdk.StateSetObject(KeyGroth16Vk, params.Groth16Vk)
+	// review6 M10: all three vkey components MUST rotate together. The prior
+	// per-field write let a propose/execute push only Groth16Vk (or VkRoot,
+	// or Sp1VkeyHash) and leave the others on the previous rotation, mixing
+	// keying material from two different proving setups — submitProof would
+	// then accept proofs that pass one component's check but were never
+	// produced under the matching counterpart. Mirror init's all-required
+	// rule.
+	if params.Groth16Vk == "" || params.VkRoot == "" || params.Sp1VkeyHash == "" {
+		ce.Abort(ce.ErrInput, "updateVkey requires all three fields: groth16_vk, vk_root, sp1_vkey_hash", "updateVkey")
+		return
 	}
-	if params.VkRoot != "" {
-		sdk.StateSetObject(KeyVkRoot, params.VkRoot)
-	}
-	if params.Sp1VkeyHash != "" {
-		sdk.StateSetObject(KeySp1VkeyHash, params.Sp1VkeyHash)
-	}
+	sdk.StateSetObject(KeyGroth16Vk, params.Groth16Vk)
+	sdk.StateSetObject(KeyVkRoot, params.VkRoot)
+	sdk.StateSetObject(KeySp1VkeyHash, params.Sp1VkeyHash)
 }
 
 // --- Permissionless proof submission ---
@@ -488,10 +494,12 @@ func parseHeader(rlpHex string) parsedHeader {
 	rlpBytes, err := hex.DecodeString(rlpHex)
 	if err != nil {
 		ce.Abort(ce.ErrInvalidHex, "invalid rlp_hex", "submitProof")
+		return parsedHeader{} // L6 review6: defense-in-depth for no-op Abort stub
 	}
 	payloadStart, _, _, isList := readRLPItem(rlpBytes, 0)
 	if !isList {
 		ce.Abort(ce.ErrInput, "rlp not a list", "submitProof")
+		return parsedHeader{} // L6 review6: defense-in-depth for no-op Abort stub
 	}
 	p := payloadStart
 	var h parsedHeader
@@ -518,9 +526,15 @@ func parseHeader(rlpHex string) parsedHeader {
 
 // readRLPItem returns (valueStart, valueLen, nextOffset, isList) for the RLP
 // item beginning at buf[offset]. Reverts on truncated/malformed input.
+//
+// L6 review6: every `ce.Abort` is followed by an explicit zero-return so a
+// no-op Abort stub (Go test build) can't fall through and return
+// out-of-bounds indices to the caller. Real WASM host terminates on Abort
+// so this is defense-in-depth for the test path.
 func readRLPItem(buf []byte, offset int) (int, int, int, bool) {
 	if offset >= len(buf) {
 		ce.Abort(ce.ErrInput, "rlp truncated", "submitProof")
+		return 0, 0, 0, false
 	}
 	b := buf[offset]
 	switch {
@@ -531,34 +545,40 @@ func readRLPItem(buf []byte, offset int) (int, int, int, bool) {
 		l := int(b - 0x80)
 		if offset+1+l > len(buf) {
 			ce.Abort(ce.ErrInput, "rlp string truncated", "submitProof")
+			return 0, 0, 0, false
 		}
 		return offset + 1, l, offset + 1 + l, false
 	case b < 0xc0:
 		ll := int(b - 0xb7)
 		if offset+1+ll > len(buf) {
 			ce.Abort(ce.ErrInput, "rlp long-string len truncated", "submitProof")
+			return 0, 0, 0, false
 		}
 		l := readRLPLen(buf[offset+1 : offset+1+ll])
 		end := offset + 1 + ll + l
 		if end > len(buf) {
 			ce.Abort(ce.ErrInput, "rlp long-string truncated", "submitProof")
+			return 0, 0, 0, false
 		}
 		return offset + 1 + ll, l, end, false
 	case b < 0xf8:
 		l := int(b - 0xc0)
 		if offset+1+l > len(buf) {
 			ce.Abort(ce.ErrInput, "rlp short-list truncated", "submitProof")
+			return 0, 0, 0, false
 		}
 		return offset + 1, l, offset + 1 + l, true
 	default:
 		ll := int(b - 0xf7)
 		if offset+1+ll > len(buf) {
 			ce.Abort(ce.ErrInput, "rlp long-list len truncated", "submitProof")
+			return 0, 0, 0, false
 		}
 		l := readRLPLen(buf[offset+1 : offset+1+ll])
 		end := offset + 1 + ll + l
 		if end > len(buf) {
 			ce.Abort(ce.ErrInput, "rlp long-list truncated", "submitProof")
+			return 0, 0, 0, false
 		}
 		return offset + 1 + ll, l, end, true
 	}
@@ -567,6 +587,7 @@ func readRLPItem(buf []byte, offset int) (int, int, int, bool) {
 func readRLPLen(buf []byte) int {
 	if len(buf) > 8 {
 		ce.Abort(ce.ErrInput, "rlp len overflow", "submitProof")
+		return 0 // L6 review6: defense-in-depth for no-op Abort stub
 	}
 	var v int
 	for _, b := range buf {
@@ -579,9 +600,11 @@ func readBytes32(buf []byte, offset int, out *[32]byte) int {
 	s, l, next, isList := readRLPItem(buf, offset)
 	if isList {
 		ce.Abort(ce.ErrInput, "rlp expected string, got list", "submitProof")
+		return next // L6 review6: defense-in-depth for no-op Abort stub
 	}
 	if l != 32 {
 		ce.Abort(ce.ErrInput, "rlp expected 32-byte field", "submitProof")
+		return next // L6 review6: defense-in-depth for no-op Abort stub
 	}
 	copy(out[:], buf[s:s+32])
 	return next
