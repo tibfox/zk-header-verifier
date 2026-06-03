@@ -683,7 +683,16 @@ func getMaxRetention() uint64 {
 func checkOwner() {
 	caller := sdk.GetEnv().Caller.String()
 	owner := sdk.GetEnvKey("contract.owner")
-	if owner == nil || caller != *owner {
+	// review6 closure (F11 / INFO-11): reject the degenerate
+	// "owner=='' && caller==''" pass-through. Without this, an
+	// unconfigured contract (no owner set) would let any unauthenticated
+	// caller execute owner-only handlers. Single explicit guard before
+	// the equality check.
+	if owner == nil || *owner == "" {
+		ce.Abort(ce.ErrNoPermission, "owner not set on this contract", "auth")
+		return
+	}
+	if caller != *owner {
 		ce.Abort(ce.ErrNoPermission, "owner required", "auth")
 	}
 }
