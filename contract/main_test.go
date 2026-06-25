@@ -10,13 +10,22 @@ import (
 // Real SP1-Helios v6.1.0 ABI-encoded ProofOutputs for Sepolia block 10764834.
 // Sourced from go-vsc-node modules/wasm/sdk/sp1_verifier_test.go.
 //
-// NOTE: this corpus is from BEFORE W4 Cluster B Site 5 added the chainId
-// slot to ProofOutputs. Tests reading the legacy corpus expect
-// parseProvenFields to abort with ErrInput at the new
-// PvMinLenWithChainId guard. Once the prover is rebuilt and a new corpus
-// fixture is committed, swap the legacy const for the new one and the
-// happy-path test below flips to "should succeed AND produce the
-// expected chainId."
+// This is a legacy (pre-chainId) encoding: 13 ABI slots (416 bytes) whose
+// final field is an EMPTY storageSlots[] dynamic array — slot 11 (byte 352)
+// holds its offset pointer (0x160) and slot 12 (byte 384) holds its length
+// (0). It predates W4 Cluster B Site 5's chainId extension and carries no
+// chainId commitment.
+//
+// Watch the collision: the empty-array length slot lands exactly at
+// PvFieldChainId (byte 384), and the corpus is exactly PvMinLenWithChainId
+// (416) bytes. So parseProvenFields cannot reject this on length — it
+// succeeds and reads chainId == 0 (the array length). Length alone cannot
+// distinguish a legacy proof from a new one; only the SP1 verifying key
+// can. A legacy proof is still rejected, downstream: submitProof compares
+// the (zero) provenChainId against the verifier's bound chainId — forced
+// non-zero at init — and aborts with ErrTransaction. When a rebuilt prover
+// emits a real chainId, commit a new fixture and add a test asserting the
+// expected non-zero value.
 const v6_1_0_PublicValuesHex = "00000000000000000000000000000000000000000000000000000000000000201024268bf088fa5770d276017f20a3fa4e0cc13c5f854b3a8b1f791cc1b85c3a00000000000000000000000000000000000000000000000000000000009af1e04577257aad51ec8b4519e0ba0546f2a032b2534f87f811a19b27b4d42278787d00000000000000000000000000000000000000000000000000000000009af220999525d0726b588e6cc9bd6841eb5393bc0b5137d980b30f8ed136efdd8a348e6efab94327bc2fd7eae04922c44be6be72f4e9f402410df10131be20870dc15e7cfbfa1dcd1490246a97443bbcce8e841e432d25df8f2ad1b6258e06441a3bdf0000000000000000000000000000000000000000000000000000000000a442224577257aad51ec8b4519e0ba0546f2a032b2534f87f811a19b27b4d42278787d4293e591071f6fb96e4a99a578693578bf4a9125c17b20abb845d3861c248ee000000000000000000000000000000000000000000000000000000000000001600000000000000000000000000000000000000000000000000000000000000000"
 
 const (
@@ -34,21 +43,33 @@ func mustDecodeHex(t *testing.T, s string) []byte {
 	return b
 }
 
-// W4 Cluster B Site 6: legacy SP1 v6.1.0 corpus lacks the chainId slot.
-// parseProvenFields now requires PvMinLenWithChainId=416 bytes to fully
-// decode; the legacy corpus is 384 bytes (12 head + 0 storage slots),
-// which IS below the new threshold AFTER the chainId slot landed. The
-// expected behavior is therefore: ErrInput "too short for chainId
-// field". A future fixture from a rebuilt prover will pass the boundary
-// and this test should be swapped at that point.
-func TestParseProvenFields_LegacyCorpusRejectedPostExtension(t *testing.T) {
+// Golden decode of parseProvenFields against a REAL alloy-abi-encoded
+// ProofOutputs blob — the only parser test that does. The other parser
+// tests plant bytes at the same offset constant they read back
+// (e.g. pv[PvFieldBlockNumber+31] then read via PvFieldBlockNumber), so a
+// wrong offset shifts write and read together and goes undetected. The
+// known-good stateRoot/blockHash/blockNumber below are the sole non-circular
+// anchor for those security-critical offsets.
+//
+// chainId is intentionally not asserted: this corpus predates the chainId
+// extension, so PvFieldChainId reads the empty storageSlots[] length (0),
+// not a committed chainId. There is no meaningful invariant to pin there —
+// see the const block above. A real chainId needs a fixture from a rebuilt
+// prover.
+func TestParseProvenFields_DecodesRealV6_1_0Corpus(t *testing.T) {
 	pv := mustDecodeHex(t, v6_1_0_PublicValuesHex)
-	_, _, _, _, err := parseProvenFields(pv)
-	if err == nil {
-		t.Fatal("expected error for legacy (pre-chainId) corpus")
+	stateRoot, blockHash, blockNumber, _, err := parseProvenFields(pv)
+	if err != nil {
+		t.Fatalf("unexpected error parsing real corpus: %v", err)
 	}
-	if err.Symbol != ce.ErrInput {
-		t.Errorf("symbol = %q, want ErrInput", err.Symbol)
+	if stateRoot != expectedStateRoot {
+		t.Errorf("stateRoot = %q, want %q", stateRoot, expectedStateRoot)
+	}
+	if blockHash != expectedBlockHash {
+		t.Errorf("blockHash = %q, want %q", blockHash, expectedBlockHash)
+	}
+	if blockNumber != expectedBlockNumber {
+		t.Errorf("blockNumber = %d, want %d", blockNumber, expectedBlockNumber)
 	}
 }
 
